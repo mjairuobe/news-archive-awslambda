@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -19,6 +20,82 @@ logger.setLevel(logging.INFO)
 _FEED_LIST_PATH = Path(__file__).resolve().parent / "feeds.json"
 _DEFAULT_FETCH_TIMEOUT_S = 30
 _MAX_WORKERS = 16
+# Default bucket if no env var: globally unique per account + region (S3 naming rules).
+_DEFAULT_BUCKET_PREFIX = "rss-news-archive"
+
+
+def _aws_region() -> str:
+    return (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or "eu-central-1"
+    )
+
+
+def _default_bucket_name(account_id: str, region: str) -> str:
+    r = region.replace("_", "-").lower()
+    return f"{_DEFAULT_BUCKET_PREFIX}-{account_id}-{r}"
+
+
+def _resolve_bucket_name() -> str:
+    for key in ("FEEDS_S3_BUCKET", "S3_BUCKET"):
+        b = os.environ.get(key)
+        if b:
+            return b.strip()
+    sts = boto3.client("sts")
+    aid = sts.get_caller_identity()["Account"]
+    return _default_bucket_name(aid, _aws_region())
+
+
+def _ensure_bucket_exists(s3_client: Any, bucket: str, region: str) -> None:
+    """Create the bucket in this region if it does not exist."""
+    try:
+        s3_client.head_bucket(Bucket=bucket)
+        return
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        # 403: exists but no access, or bucket in other account
+        if str(code) in ("403", "AccessDenied"):
+            raise RuntimeError(
+                f"S3 bucket {bucket!r}: access denied on HeadBucket; "
+                "check IAM or set FEEDS_S3_BUCKET / S3_BUCKET to a bucket you control."
+            ) from e
+        # Missing bucket (SDK/API variants)
+        if str(code) not in (
+            "404",
+            "NotFound",
+            "NoSuchBucket",
+        ):
+            raise RuntimeError(
+                f"Cannot verify S3 bucket {bucket!r}: {e.response['Error'].get('Message', code)}"
+            ) from e
+
+    params: dict[str, Any] = {"Bucket": bucket}
+    if region != "us-east-1":
+        params["CreateBucketConfiguration"] = {
+            "LocationConstraint": region,
+        }
+    try:
+        s3_client.create_bucket(**params)
+        logger.info("Created S3 bucket %s in region %s", bucket, region)
+    except ClientError as e:
+        create_code = e.response["Error"]["Code"]
+        if create_code == "BucketAlreadyOwnedByYou":
+            return
+        if create_code == "BucketAlreadyExists":
+            raise RuntimeError(
+                f"S3 bucket name {bucket!r} is already taken globally. "
+                "Set FEEDS_S3_BUCKET or S3_BUCKET to an available name."
+            ) from e
+        if create_code == "OperationAborted":
+            try:
+                s3_client.head_bucket(Bucket=bucket)
+                return
+            except ClientError:
+                pass
+        raise RuntimeError(
+            f"Could not create S3 bucket {bucket!r}: {e.response['Error'].get('Message', create_code)}"
+        ) from e
 
 
 def _domain_label_without_tld(hostname: str) -> str:
@@ -174,14 +251,12 @@ def _process_one_feed(
 
 
 def handler(event, context):
-    bucket = os.environ.get("FEEDS_S3_BUCKET") or os.environ.get("S3_BUCKET")
-    if not bucket:
-        return {
-            "statusCode": 500,
-            "body": json.dumps(
-                {"error": "FEEDS_S3_BUCKET or S3_BUCKET environment variable not set"}
-            ),
-        }
+    region = _aws_region()
+    try:
+        bucket = _resolve_bucket_name()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Could not resolve S3 bucket name")
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
 
     timeout_s = int(os.environ.get("FEED_FETCH_TIMEOUT_S", _DEFAULT_FETCH_TIMEOUT_S))
     date_prefix = datetime.now(timezone.utc).strftime("%d-%m-%Y")
@@ -195,7 +270,12 @@ def handler(event, context):
             "body": json.dumps({"error": str(e)}),
         }
 
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        _ensure_bucket_exists(s3, bucket, region)
+    except RuntimeError as e:
+        logger.error("%s", e)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
     results: list[dict[str, Any]] = []
     ok_count = 0
 
