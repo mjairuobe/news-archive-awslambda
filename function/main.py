@@ -1,17 +1,16 @@
+import asyncio
 import json
 import logging
 import os
 import re
 import secrets
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 import boto3
+import httpx
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -19,9 +18,15 @@ logger.setLevel(logging.INFO)
 
 _FEED_LIST_PATH = Path(__file__).resolve().parent / "feeds.json"
 _DEFAULT_FETCH_TIMEOUT_S = 30
-_MAX_WORKERS = 16
+_DEFAULT_CONCURRENT_REQUESTS = 5
+_MAX_CONCURRENT_CAP = 500
 # Default bucket if no env var: globally unique per account + region (S3 naming rules).
 _DEFAULT_BUCKET_PREFIX = "rss-news-archive"
+
+_HTTP_HEADERS = {
+    "User-Agent": "rss-archive-lambda/1.0 (+https://github.com/aws-lambda)",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
 
 
 def _aws_region() -> str:
@@ -154,25 +159,27 @@ def _load_feed_list() -> list[dict[str, Any]]:
     return data
 
 
-def _fetch_feed(url: str, timeout_s: int) -> tuple[int, bytes, str | None]:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "rss-archive-lambda/1.0 (+https://github.com/aws-lambda)",
-            "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        },
+def _parse_concurrent_requests() -> int:
+    raw = os.environ.get(
+        "RSS_FEED_CONCURRENT_REQUESTS",
+        str(_DEFAULT_CONCURRENT_REQUESTS),
     )
-    with urlopen(req, timeout=timeout_s) as resp:
-        status = getattr(resp, "status", 200)
-        body = resp.read()
-        ctype = resp.headers.get("Content-Type")
-    return status, body, ctype
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "Invalid RSS_FEED_CONCURRENT_REQUESTS=%r, using default %s",
+            raw,
+            _DEFAULT_CONCURRENT_REQUESTS,
+        )
+        return _DEFAULT_CONCURRENT_REQUESTS
+    return max(1, min(n, _MAX_CONCURRENT_CAP))
 
 
-def _process_one_feed(
+async def _process_one_feed(
+    client: httpx.AsyncClient,
     item: dict[str, Any],
     bucket: str,
-    timeout_s: int,
     s3_client: Any,
     date_prefix: str,
 ) -> dict[str, Any]:
@@ -191,20 +198,16 @@ def _process_one_feed(
         }
 
     try:
-        status, body, ctype = _fetch_feed(xml_url, timeout_s)
-    except HTTPError as e:
+        resp = await client.get(xml_url)
+        status = resp.status_code
+        body = resp.content
+        ctype = resp.headers.get("Content-Type")
+    except httpx.RequestError as e:
         return {
             "xmlUrl": xml_url,
             "title": title,
             "ok": False,
-            "error": f"HTTP {e.code}",
-        }
-    except URLError as e:
-        return {
-            "xmlUrl": xml_url,
-            "title": title,
-            "ok": False,
-            "error": f"URL error: {e.reason}",
+            "error": f"request error: {e}",
         }
     except Exception as e:  # noqa: BLE001
         return {
@@ -234,10 +237,13 @@ def _process_one_feed(
         "contentType": ctype,
         "bodyText": body.decode("utf-8", errors="replace"),
     }
-    s3_client.put_object(
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    await asyncio.to_thread(
+        s3_client.put_object,
         Bucket=bucket,
         Key=key,
-        Body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        Body=body_bytes,
         ContentType="application/json; charset=utf-8",
     )
 
@@ -250,6 +256,41 @@ def _process_one_feed(
     }
 
 
+async def _run_async(
+    feed_items: list[dict[str, Any]],
+    bucket: str,
+    timeout_s: int,
+    max_concurrent: int,
+    s3_client: Any,
+    date_prefix: str,
+) -> tuple[list[dict[str, Any]], int]:
+    timeout = httpx.Timeout(timeout_s)
+    limits = httpx.Limits(max_connections=max(max_concurrent * 2, 16))
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def bounded(item: dict[str, Any], client: httpx.AsyncClient) -> dict[str, Any]:
+        async with sem:
+            return await _process_one_feed(
+                client,
+                item,
+                bucket,
+                s3_client,
+                date_prefix,
+            )
+
+    async with httpx.AsyncClient(
+        headers=_HTTP_HEADERS,
+        timeout=timeout,
+        limits=limits,
+        follow_redirects=True,
+    ) as client:
+        results = await asyncio.gather(
+            *(bounded(item, client) for item in feed_items)
+        )
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return list(results), ok_count
+
+
 def handler(event, context):
     region = _aws_region()
     try:
@@ -259,6 +300,7 @@ def handler(event, context):
         return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
 
     timeout_s = int(os.environ.get("FEED_FETCH_TIMEOUT_S", _DEFAULT_FETCH_TIMEOUT_S))
+    max_concurrent = _parse_concurrent_requests()
     date_prefix = datetime.now(timezone.utc).strftime("%d-%m-%Y")
 
     try:
@@ -276,29 +318,22 @@ def handler(event, context):
     except RuntimeError as e:
         logger.error("%s", e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
-    results: list[dict[str, Any]] = []
-    ok_count = 0
 
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _process_one_feed,
-                item,
-                bucket,
-                timeout_s,
-                s3,
-                date_prefix,
-            ): item
-            for item in feed_items
-        }
-        for fut in as_completed(futures):
-            results.append(fut.result())
-            if results[-1].get("ok"):
-                ok_count += 1
+    results, ok_count = asyncio.run(
+        _run_async(
+            feed_items,
+            bucket,
+            timeout_s,
+            max_concurrent,
+            s3,
+            date_prefix,
+        )
+    )
 
     failed = [r for r in results if not r.get("ok")]
     summary = {
         "bucket": bucket,
+        "maxConcurrentRequests": max_concurrent,
         "total": len(feed_items),
         "stored": ok_count,
         "failed": len(failed),
